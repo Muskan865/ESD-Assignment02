@@ -1,0 +1,54 @@
+// Tiny Shop order service - Assignment 2, Part B.
+//
+// PlaceOrder is the gRPC version of HTTP `POST /api/orders`. Both are thin
+// adapters over the same function, app/orders.py:place_order(), against the
+// same Postgres database, so validation, stock rules, payment and idempotency
+// behave identically whichever interface a caller uses.
+//
+// Errors are reported as gRPC status codes, never inside the response message.
+// The trailing metadata key `error-code` carries the same machine-readable
+// code the HTTP API returns in its problem+json body (e.g. "out_of_stock").
+// Correlation: send `x-request-id` as request metadata; the server echoes it
+// in the initial response metadata and forwards it to payment-service.
+//
+// Regenerate the Python code after editing:  python scripts/generate_grpc.py
+
+syntax = "proto3";
+
+package tinyshop.orders.v1;
+
+service OrderService {
+  rpc PlaceOrder(PlaceOrderRequest) returns (PlaceOrderResponse);
+}
+
+enum PaymentMethod {
+  // Not set: treated as CARD, the same default as the HTTP API.
+  PAYMENT_METHOD_UNSPECIFIED = 0;
+  PAYMENT_METHOD_CARD = 1;
+  PAYMENT_METHOD_WALLET = 2;
+  PAYMENT_METHOD_COD = 3;
+}
+
+message CartLine {
+  string sku = 1;       // 1-16 characters
+  int32 quantity = 2;   // 1-20
+}
+
+message PlaceOrderRequest {
+  repeated CartLine items = 1;      // 1-20 lines
+  string customer = 2;              // display name, 1-40 chars; empty = "guest"
+  PaymentMethod payment_method = 3;
+  // Optional. Repeating a call with the same key returns the original order
+  // instead of placing (and charging) a second one. Same key space as the
+  // HTTP Idempotency-Key header.
+  string idempotency_key = 4;
+}
+
+message PlaceOrderResponse {
+  int64 order_id = 1;
+  string status = 2;        // PLACED (or the order's current status on a replay)
+  int64 total_cents = 3;    // integer cents: no floating-point money on the wire
+  int32 item_count = 4;
+  bool replayed = 5;        // true when answered from an earlier call with the same key
+  string request_id = 6;
+}

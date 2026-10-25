@@ -90,7 +90,9 @@ ORDERS_CANCELLED = Counter(
 ORDERS_REJECTED = Counter(
     "shop_orders_rejected_total",
     "Checkout attempts that did not become an order.",
-    ["reason"],  # bounded: out_of_stock | payment_declined | payment_error | empty_cart
+    # bounded: unknown_sku | out_of_stock | payment_declined | payment_error |
+    #          payment_timeout | idempotency_key_reused
+    ["reason"],
 )
 
 # GAUGE — orders sitting in PLACED, waiting to be shipped. Up on placement,
@@ -135,8 +137,63 @@ ITEMS_PER_ORDER = Summary(
 CHECKOUT_DURATION = Histogram(
     "shop_checkout_duration_seconds",
     "End-to-end duration of a checkout attempt, in seconds.",
-    ["outcome"],  # bounded: placed | rejected | error
+    ["outcome"],  # bounded: placed | replayed | rejected | error
     buckets=LATENCY_BUCKETS,
+)
+
+# ============================================================ ASSIGNMENT 2 ==
+# gRPC server metrics for the order service (written by app/grpc_server.py).
+# Names follow the de-facto convention of go-grpc-prometheus / py-grpc-prometheus
+# so standard gRPC dashboards and alerts work unchanged. Labels are bounded:
+# grpc_service and grpc_method come from the .proto (one service, one method),
+# grpc_code is one of the 17 canonical gRPC status codes. Calls to methods the
+# server does not implement are never recorded, so a client cannot invent label
+# values.
+
+# COUNTER — calls and errors, by method and final status code.
+GRPC_HANDLED = Counter(
+    "grpc_server_handled_total",
+    "RPCs completed on the server, by method and gRPC status code.",
+    ["grpc_service", "grpc_method", "grpc_code"],
+)
+
+# HISTOGRAM — server-side handling time, from the interceptor receiving the
+# call to the handler returning or aborting. Same buckets as the HTTP
+# histogram, so p50/p95 of the two interfaces are directly comparable.
+GRPC_HANDLING = Histogram(
+    "grpc_server_handling_seconds",
+    "Server-side duration of an RPC, in seconds.",
+    ["grpc_service", "grpc_method"],
+    buckets=LATENCY_BUCKETS,
+)
+
+# GAUGE — RPCs being handled right now. The server has a fixed thread pool
+# (GRPC_MAX_WORKERS); when this reaches that number new calls queue.
+GRPC_IN_FLIGHT = Gauge(
+    "grpc_server_in_flight",
+    "RPCs currently being handled by the server.",
+    ["grpc_service", "grpc_method"],
+)
+
+# COUNTER — orders answered from an earlier call with the same idempotency
+# key instead of being placed (and charged) again. Non-zero means callers are
+# retrying, and that the protection is doing its job.
+IDEMPOTENT_REPLAYS = Counter(
+    "shop_idempotent_replays_total",
+    "Order requests answered from an earlier call with the same idempotency key.",
+    ["interface"],  # bounded: http | grpc
+)
+
+# GAUGES — Postgres pool saturation. Part E.1 of A1 was a pool exhaustion
+# incident that no metric showed directly; with two processes now sharing the
+# database, each reports its own pool.
+DB_POOL_IN_USE = Gauge(
+    "db_pool_connections_in_use",
+    "Postgres connections currently borrowed from this process's pool.",
+)
+DB_POOL_MAX = Gauge(
+    "db_pool_connections_max",
+    "Size of this process's Postgres connection pool.",
 )
 
 # ======================================================= CARDINALITY DEMO ====

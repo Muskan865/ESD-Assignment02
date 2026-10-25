@@ -6,7 +6,7 @@ import time
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from .state import CHAOS, LOCK, reset_chaos, snapshot
+from .state import CHAOS, LOCK, claim_forced_failure, reset_chaos, snapshot
 from .structured_logging import log_event
 from .telemetry import CHARGE_AMOUNT, CHARGES
 
@@ -38,7 +38,8 @@ def charge(payload: ChargeRequest, request: Request):
         time.sleep(chaos["latency_seconds"])
 
     # --- injected hard failure (Part E fault) ---
-    if chaos["failure_rate"] > 0 and random.random() < chaos["failure_rate"]:
+    forced = claim_forced_failure()
+    if forced or (chaos["failure_rate"] > 0 and random.random() < chaos["failure_rate"]):
         CHARGES.labels(outcome="error").inc()
         log_event(
             "charge failed at provider",
@@ -87,6 +88,7 @@ class LatencyFault(BaseModel):
 
 class FailureFault(BaseModel):
     rate: float = Field(ge=0.0, le=1.0)
+    fail_next: int = Field(default=0, ge=0, le=1000)
 
 
 @router.post("/chaos/latency")
@@ -102,9 +104,10 @@ def set_latency(fault: LatencyFault):
 
 @router.post("/chaos/failure")
 def set_failure(fault: FailureFault):
-    """Answer a fraction of charges with HTTP 503."""
+    """Answer a fraction of charges, and/or exactly the next `fail_next`, with 503."""
     with LOCK:
         CHAOS["failure_rate"] = fault.rate
+        CHAOS["fail_next"] = fault.fail_next
     log_event("chaos: failure fault set", level="warn", fault=fault.model_dump())
     return snapshot()
 

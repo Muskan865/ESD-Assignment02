@@ -33,5 +33,19 @@ if CARDINALITY_DEMO_LABEL not in ("request_id", "none"):
 # (~30-90 ms) and a faulted one (~530-590 ms) fall in visibly different buckets.
 LATENCY_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0)
 
+# --- Assignment 2 ---------------------------------------------------------
+# Rate limit on POST /api/orders: a token bucket per client IP. RATE tokens are
+# added per second up to BURST; each request spends one. 20/s sustained is
+# double the A1 load generator (10 rps), so the experiments are never limited.
+ORDERS_RATE_LIMIT_PER_SECOND = float(os.getenv("ORDERS_RATE_LIMIT_PER_SECOND", "20"))
+ORDERS_RATE_LIMIT_BURST = int(os.getenv("ORDERS_RATE_LIMIT_BURST", "40"))
+
+# The gRPC order service (same code base, separate process/container).
+GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
+GRPC_METRICS_PORT = int(os.getenv("GRPC_METRICS_PORT", "9102"))
+# Matches the size of the Postgres pool: a handler thread with no connection
+# to use would only wait in db.cursor() anyway.
+GRPC_MAX_WORKERS = int(os.getenv("GRPC_MAX_WORKERS", "10"))
+
 # Basket value distribution — dollars, coarse edges, it is a business metric.
 ORDER_VALUE_BUCKETS = (10, 25, 50, 100, 150, 250, 500, 1000)

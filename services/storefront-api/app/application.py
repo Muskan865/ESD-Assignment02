@@ -5,11 +5,12 @@ import traceback
 import uuid
 from pathlib import Path
 
+import yaml
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from . import db
+from . import db, errors
 from .config import SERVICE_NAME
 from .routes import refresh_open_orders_gauge, refresh_stock_gauge, router
 from .state import should_emit
@@ -18,11 +19,32 @@ from .telemetry import DEMO_HAS_ID_LABEL, DEMO_REQUESTS, IN_FLIGHT, REQUEST_COUN
 
 app = FastAPI(
     title="Tiny Shop - Storefront API",
-    version="1.0.0",
-    description="A very small e-commerce API, instrumented for Assignment 1.",
+    version="2.0.0",
+    description=(
+        "A very small e-commerce API. Assignment 2: resource-oriented order "
+        "endpoints, idempotent order creation (`Idempotency-Key`), a per-client "
+        "rate limit on `POST /api/orders`, and one error format for every "
+        "failure: RFC 9457 problem details (`application/problem+json`) with a "
+        "stable `code` and the `request_id`."
+    ),
 )
+errors.install(app)
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+# The hand-written OpenAPI document is the API contract (A2 Part A). Serving it
+# instead of FastAPI's generated schema means /docs shows exactly what callers
+# are promised; tests/test_assignment2.py fails if the routes drift from it.
+OPENAPI_FILE = Path(__file__).resolve().parent.parent / "openapi.yaml"
+
+
+def _openapi() -> dict:
+    if app.openapi_schema is None:
+        app.openapi_schema = yaml.safe_load(OPENAPI_FILE.read_text(encoding="utf-8"))
+    return app.openapi_schema
+
+
+app.openapi = _openapi
 
 # Scraped or polled constantly. Recording them would bury real traffic in both
 # the metrics and the log index.
@@ -79,8 +101,7 @@ async def observe(request: Request, call_next):
             url={"path": request.url.path, "route": _route_template(request)},
             request_id=request_id,
         )
-        return JSONResponse(status_code=500, content={"detail": "internal error"},
-                            headers={"x-request-id": request_id})
+        return errors.problem_response(request, 500, "internal_error", "internal error")
     finally:
         duration = time.perf_counter() - started
         IN_FLIGHT.dec()
@@ -115,7 +136,7 @@ async def database_busy(request: Request, exc: db.PoolTimeout):
     """Every connection stayed busy for DB_POOL_WAIT_SECONDS: shed load cleanly.
 
     503 tells the client "retry later", unlike the bare 500 an exhausted pool
-    used to produce.
+    used to produce; Retry-After says when.
     """
     log_event(
         "database busy",
@@ -124,7 +145,8 @@ async def database_busy(request: Request, exc: db.PoolTimeout):
         url={"path": request.url.path, "route": _route_template(request)},
         request_id=getattr(request.state, "request_id", "-"),
     )
-    return JSONResponse(status_code=503, content={"detail": "database busy, retry"})
+    return errors.problem_response(request, 503, "database_busy", "database busy, retry",
+                                   headers={"Retry-After": "1"})
 
 
 # ----------------------------------------------------------------- ops routes
@@ -150,7 +172,18 @@ def ready():
 
 @app.get("/metrics", tags=["ops"])
 def metrics():
-    """Prometheus exposition endpoint -- the raw text Prometheus scrapes."""
+    """Prometheus exposition endpoint -- the raw text Prometheus scrapes.
+
+    The two business gauges are re-read from Postgres on every scrape. Orders
+    placed through the gRPC service change them too, and only the database
+    knows about both. A failed read keeps the last value rather than failing
+    the scrape: the rest of the metrics matter most when the database is sick.
+    """
+    try:
+        refresh_stock_gauge()
+        refresh_open_orders_gauge()
+    except Exception as exc:
+        log_event("gauge refresh failed", level="warn", error={"type": type(exc).__name__})
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
@@ -186,9 +219,15 @@ def startup():
                   error={"type": type(last_error).__name__})
         return
 
+    try:
+        db.ensure_schema()
+    except Exception as exc:
+        # The gRPC service runs the same migration; losing that race is harmless.
+        log_event("schema migration skipped", level="warn",
+                  error={"type": type(exc).__name__, "message": str(exc)[:200]})
     refresh_stock_gauge()
     refresh_open_orders_gauge()
-    log_event("service started", service_version="1.0.0")
+    log_event("service started", service_version="2.0.0")
 
 
 @app.on_event("shutdown")

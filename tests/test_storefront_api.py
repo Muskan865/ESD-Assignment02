@@ -6,154 +6,15 @@ It does NOT validate the SQL itself - that is checked against real Postgres.
 import contextlib
 import io
 import json
-import pathlib
 import sys
-import types
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent
-                       / "services" / "storefront-api"))
-
-# --- stub psycopg2 before app.db imports it -------------------------------
-fake_psycopg2 = types.ModuleType("psycopg2")
-fake_extras = types.ModuleType("psycopg2.extras")
-fake_pool = types.ModuleType("psycopg2.pool")
-fake_extras.RealDictCursor = object
-class _Pool:
-    def __init__(self, *a, **k): pass
-fake_pool.ThreadedConnectionPool = _Pool
-fake_psycopg2.extras = fake_extras
-fake_psycopg2.pool = fake_pool
-sys.modules["psycopg2"] = fake_psycopg2
-sys.modules["psycopg2.extras"] = fake_extras
-sys.modules["psycopg2.pool"] = fake_pool
-
+from fake_shop import (  # noqa: E402  (stubs psycopg2 and patches the app)
+    PAYMENT_MODE, PRODUCT_LOCKS, check, fake_cursor, finish, metric_value,
+    real_db_cursor,
+)
 from fastapi.testclient import TestClient  # noqa: E402
-from app import db, clients  # noqa: E402
-real_db_cursor = db.cursor  # kept to test the pool-wait logic itself
-
-# --- in-memory database ----------------------------------------------------
-PRODUCTS = {
-    "KB-01": {"sku": "KB-01", "name": "Mechanical Keyboard", "price_cents": 4900, "stock": 40},
-    "MS-01": {"sku": "MS-01", "name": "Wireless Mouse", "price_cents": 1900, "stock": 60},
-    "OUT-01": {"sku": "OUT-01", "name": "Sold Out Thing", "price_cents": 500, "stock": 0},
-}
-ORDERS = {}
-NEXT_ID = [1000]
-COMMITS = []
-PRODUCT_LOCKS = []  # every statement that row-locks products
-
-
-class FakeConn:
-    def commit(self): COMMITS.append("commit")
-    def rollback(self): COMMITS.append("rollback")
-
-
-class FakeCursor:
-    def __init__(self): self._rows = []; self.connection = FakeConn()
-
-    def execute(self, sql, params=None):
-        s = " ".join(sql.split())
-        if "FROM products" in s and "FOR UPDATE" in s:
-            PRODUCT_LOCKS.append(s)
-        if "FROM products WHERE sku = ANY" in s:
-            self._rows = [dict(PRODUCTS[k]) for k in params[0] if k in PRODUCTS]
-        elif s.startswith("SELECT sku, stock FROM products"):
-            self._rows = [{"sku": p["sku"], "stock": p["stock"]} for p in PRODUCTS.values()]
-        elif s.startswith("SELECT sku, name, price_cents, stock FROM products ORDER BY"):
-            self._rows = [dict(p) for p in PRODUCTS.values()]
-        elif "COUNT(*) AS n FROM orders" in s:
-            self._rows = [{"n": sum(1 for o in ORDERS.values() if o["status"] == "PLACED")}]
-        elif s.startswith("INSERT INTO orders"):
-            NEXT_ID[0] += 1
-            ORDERS[NEXT_ID[0]] = {"status": "PLACED", "total_cents": params[0],
-                                  "item_count": params[1]}
-            self._rows = [{"id": NEXT_ID[0]}]
-        elif s.startswith("INSERT INTO order_items"):
-            self._rows = []
-        elif s.startswith("UPDATE products SET stock = stock -"):
-            PRODUCTS[params[1]]["stock"] -= params[0]
-            self._rows = []
-        elif s.startswith("UPDATE products SET stock = %s"):
-            for p in PRODUCTS.values():
-                p["stock"] = params[0]
-            self._rows = []
-        elif "SELECT status, total_cents FROM orders WHERE id" in s:
-            o = ORDERS.get(params[0])
-            self._rows = [{"status": o["status"], "total_cents": o["total_cents"]}] if o else []
-        elif "SELECT status FROM orders WHERE id" in s:
-            o = ORDERS.get(params[0])
-            self._rows = [{"status": o["status"]}] if o else []
-        elif s.startswith("UPDATE orders SET status = 'CANCELLED'"):
-            ORDERS[params[0]]["status"] = "CANCELLED"; self._rows = []
-        elif s.startswith("UPDATE orders SET status = 'FULFILLED'"):
-            ORDERS[params[0]]["status"] = "FULFILLED"; self._rows = []
-        elif s.startswith("UPDATE products p SET stock"):
-            self._rows = []
-        elif "SELECT id, status, total_cents" in s:
-            self._rows = [{"id": k, "status": v["status"], "total_cents": v["total_cents"],
-                           "item_count": v["item_count"], "customer": "test",
-                           "created_at": "2026-09-22T00:00:00Z"}
-                          for k, v in sorted(ORDERS.items(), reverse=True)]
-        elif s.startswith("SELECT sku FROM products ORDER BY sku FOR UPDATE"):
-            self._rows = [{"sku": k} for k in sorted(PRODUCTS)]
-        elif s.startswith("SELECT p.sku FROM products p JOIN order_items"):
-            self._rows = []
-        elif "SELECT 1 AS ok" in s:
-            self._rows = [{"ok": 1}]
-        else:
-            raise AssertionError("unhandled SQL: " + s)
-
-    def fetchone(self): return self._rows[0] if self._rows else None
-    def fetchall(self): return self._rows
-
-
-@contextlib.contextmanager
-def fake_cursor(operation, commit=False):
-    cur = FakeCursor()
-    try:
-        yield cur
-        COMMITS.append("commit" if commit else "rollback")
-    except Exception:
-        COMMITS.append("rollback")
-        raise
-
-
-db.cursor = fake_cursor
-db.init_pool = lambda *a, **k: None
-db.ping = lambda: True
-db.close_pool = lambda: None
-
-# patch the already-imported references inside routes
-import app.routes as routes  # noqa: E402
-routes.db.cursor = fake_cursor
-
-PAYMENT_MODE = {"outcome": clients.PaymentOutcome.APPROVED}
-
-
-def fake_charge(order_id, amount_cents, method, request_id):
-    return PAYMENT_MODE["outcome"], {"status_code": 200, "duration_ms": 12.3}
-
-
-routes.clients.charge = fake_charge
-routes.clients.post_chaos = lambda path, payload: {"stubbed": path}
-routes.clients.get_chaos_status = lambda: {"stubbed": True}
-
+from app import clients, db  # noqa: E402
 from app.application import app  # noqa: E402
-
-fails = []
-
-
-def check(label, cond, extra=""):
-    print(("  PASS  " if cond else "  FAIL  ") + label + ("  " + str(extra) if extra else ""))
-    if not cond:
-        fails.append(label)
-
-
-def metric_value(text, needle):
-    for line in text.splitlines():
-        if line.startswith(needle):
-            return float(line.rsplit(" ", 1)[1])
-    return None
 
 
 # silence the JSON log lines during the run, but capture them for inspection
@@ -178,9 +39,9 @@ with TestClient(app) as c:
 
     # --- happy path ---
     placed0 = metric_value(m0, 'shop_orders_placed_total{payment_method="card"}') or 0
-    r = c.post("/api/checkout", json={"items": [{"sku": "KB-01", "quantity": 2}],
+    r = c.post("/api/orders", json={"items": [{"sku": "KB-01", "quantity": 2}],
                                       "customer": "ayesha", "payment_method": "card"})
-    check("checkout -> 201", r.status_code == 201, r.json())
+    check("POST /api/orders -> 201", r.status_code == 201, r.json())
     body = r.json()
     check("checkout returns order_id + total", body.get("total_dollars") == 98.0, body)
     check("checkout returns a request_id", len(body.get("request_id", "")) == 12, body)
@@ -205,7 +66,7 @@ with TestClient(app) as c:
           "payment_call_duration_seconds" in m)
 
     # --- out of stock ---
-    r = c.post("/api/checkout", json={"items": [{"sku": "OUT-01", "quantity": 1}]})
+    r = c.post("/api/orders", json={"items": [{"sku": "OUT-01", "quantity": 1}]})
     check("out-of-stock checkout -> 409", r.status_code == 409, r.status_code)
     m = c.get("/metrics").text
     check("rejected{reason=out_of_stock} recorded",
@@ -214,12 +75,12 @@ with TestClient(app) as c:
           metric_value(m, 'shop_checkout_duration_seconds_count{outcome="rejected"}') == 1.0)
 
     # --- unknown sku ---
-    r = c.post("/api/checkout", json={"items": [{"sku": "NOPE-99", "quantity": 1}]})
-    check("unknown sku -> 404", r.status_code == 404, r.status_code)
+    r = c.post("/api/orders", json={"items": [{"sku": "NOPE-99", "quantity": 1}]})
+    check("unknown sku -> 422 (A2: was 404)", r.status_code == 422, r.status_code)
 
     # --- payment declined ---
     PAYMENT_MODE["outcome"] = clients.PaymentOutcome.DECLINED
-    r = c.post("/api/checkout", json={"items": [{"sku": "MS-01", "quantity": 1}]})
+    r = c.post("/api/orders", json={"items": [{"sku": "MS-01", "quantity": 1}]})
     check("declined payment -> 402", r.status_code == 402, r.status_code)
     m = c.get("/metrics").text
     check("rejected{reason=payment_declined} recorded",
@@ -227,11 +88,11 @@ with TestClient(app) as c:
 
     # --- payment error (the Part E failure mode) ---
     PAYMENT_MODE["outcome"] = clients.PaymentOutcome.ERROR
-    r = c.post("/api/checkout", json={"items": [{"sku": "MS-01", "quantity": 1}]})
+    r = c.post("/api/orders", json={"items": [{"sku": "MS-01", "quantity": 1}]})
     check("payment provider error -> 502", r.status_code == 502, r.status_code)
     PAYMENT_MODE["outcome"] = clients.PaymentOutcome.TIMEOUT
-    r = c.post("/api/checkout", json={"items": [{"sku": "MS-01", "quantity": 1}]})
-    check("payment timeout -> 502", r.status_code == 502, r.status_code)
+    r = c.post("/api/orders", json={"items": [{"sku": "MS-01", "quantity": 1}]})
+    check("payment timeout -> 504 (A2: was 502)", r.status_code == 504, r.status_code)
     m = c.get("/metrics").text
     check("rejected{reason=payment_error} recorded",
           metric_value(m, 'shop_orders_rejected_total{reason="payment_error"}') == 1.0)
@@ -245,11 +106,13 @@ with TestClient(app) as c:
     m = c.get("/metrics").text
     check("shop_orders_cancelled_total incremented",
           metric_value(m, 'shop_orders_cancelled_total{reason="customer_request"}') == 1.0)
+    check("rejected checkouts left no order behind (gauge read from DB)",
+          metric_value(m, "shop_orders_awaiting_fulfilment") == 0.0)
     check("awaiting_fulfilment gauge back to 0",
           metric_value(m, "shop_orders_awaiting_fulfilment") == 0.0)
 
     # --- fulfil ---
-    r = c.post("/api/checkout", json={"items": [{"sku": "MS-01", "quantity": 1}]})
+    r = c.post("/api/orders", json={"items": [{"sku": "MS-01", "quantity": 1}]})
     oid2 = r.json()["order_id"]
     r = c.post(f"/api/orders/{oid2}/fulfil")
     check("fulfil order -> 200", r.status_code == 200, r.json())
@@ -373,9 +236,9 @@ captured = io.StringIO()
 capture = logging.StreamHandler(captured)
 logging.getLogger("storefront-api").addHandler(capture)
 with TestClient(app, raise_server_exceptions=False) as c:
-    routes.db.cursor = exhausted_cursor
+    db.cursor = exhausted_cursor
     r = c.get("/api/products", headers={"x-request-id": "crash-test-1"})
-    routes.db.cursor = fake_cursor
+    db.cursor = fake_cursor
 logging.getLogger("storefront-api").removeHandler(capture)
 
 check("crash -> 500", r.status_code == 500, r.status_code)
@@ -457,9 +320,9 @@ captured = io.StringIO()
 capture = logging.StreamHandler(captured)
 logging.getLogger("storefront-api").addHandler(capture)
 with TestClient(app, raise_server_exceptions=False) as c:
-    routes.db.cursor = busy_cursor
+    db.cursor = busy_cursor
     r = c.get("/api/products", headers={"x-request-id": "busy-test-1"})
-    routes.db.cursor = fake_cursor
+    db.cursor = fake_cursor
 logging.getLogger("storefront-api").removeHandler(capture)
 check("pool timeout -> 503", r.status_code == 503, r.status_code)
 busy = [json.loads(ln) for ln in captured.getvalue().splitlines() if '"database busy"' in ln]
@@ -467,6 +330,4 @@ check("pool timeout logs 'database busy' with error.type and request_id",
       len(busy) == 1 and busy[0]["error"]["type"] == "PoolTimeout"
       and busy[0]["request_id"] == "busy-test-1", busy)
 
-print()
-print("FAILURES:", fails if fails else "none")
-sys.exit(1 if fails else 0)
+finish()

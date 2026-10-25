@@ -63,6 +63,16 @@ check("POST /chaos/failure -> 200", r.status_code == 200)
 r = c.post("/payment/charge", json={"order_id": 3, "amount_cents": 100})
 check("failure fault returns 503", r.status_code == 503, r.status_code)
 
+# --- fail_next: exactly N failures, then normal service (A2 caller demo) ---
+c.post("/chaos/reset")
+r = c.post("/chaos/failure", json={"rate": 0.0, "fail_next": 2})
+check("POST /chaos/failure with fail_next -> 200", r.json().get("fail_next") == 2, r.json())
+codes = [c.post("/payment/charge", json={"order_id": 10 + i, "amount_cents": 100}).status_code
+         for i in range(3)]
+check("fail_next=2 fails exactly the next two charges",
+      codes[:2] == [503, 503] and codes[2] in (200, 402), codes)
+check("fail_next counts down to 0", c.get("/chaos/status").json()["fail_next"] == 0)
+
 # --- reset clears everything ---
 r = c.post("/chaos/reset")
 state = r.json()

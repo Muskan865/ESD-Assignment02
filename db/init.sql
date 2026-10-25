@@ -36,3 +36,12 @@ INSERT INTO products (sku, name, price_cents, stock) VALUES
     ('MN-01', '27" Monitor',        21900, 12),
     ('CB-01', 'USB-C Cable',           900, 90)
 ON CONFLICT (sku) DO NOTHING;
+
+-- Assignment 2: idempotent order creation. A retried POST /api/orders (or gRPC
+-- PlaceOrder) carrying the same key finds this row instead of placing a second
+-- order. NULLs do not collide in a unique index, so keyless orders are fine.
+-- The storefront also applies these on start-up (app/db.py), so a database
+-- created by the Assignment 1 schema is upgraded without `down -v`.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS idempotency_key TEXT;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS request_hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS orders_idempotency_key_idx ON orders (idempotency_key);

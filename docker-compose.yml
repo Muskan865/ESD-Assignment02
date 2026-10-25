@@ -1,13 +1,22 @@
-# Tiny Shop — Assignment 1 (Observability) stack.
+# Tiny Shop — Assignment 1 (Observability) + Assignment 2 (APIs, gRPC) stack.
 #
-# Nine containers in three groups:
-#   application : storefront-api, payment-service, postgres
+# Ten containers in three groups:
+#   application : storefront-api, order-grpc, payment-service, postgres
 #   metrics     : prometheus, node-exporter, grafana
 #   logs        : elasticsearch, filebeat, kibana
 #
 # Structure and several hard-won configuration details (Grafana datasource uid
 # pinning, distinct Grafana mount points, Filebeat docker autodiscover) follow
 # the course Lab 1 "Midnight Launch" stack — see REPORT.md "Credits".
+
+# Filebeat reads the json-file driver's /var/lib/docker/containers/<id>/*.log.
+# Some Docker Desktop installs default to the `local` driver (binary files that
+# Filebeat cannot parse), so the application containers pin json-file.
+x-app-logging: &app-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
 
 services:
   # ---------------------------------------------------------------- application
@@ -44,6 +53,7 @@ services:
     # so infrastructure containers do not flood the log index.
     labels:
       co.elastic.logs/enabled: "true"
+    logging: *app-logging
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8001/health')"]
       interval: 5s
@@ -63,8 +73,12 @@ services:
       - DATABASE_URL=postgresql://shop:shop@postgres:5432/shop
       # Part E.2: `none` removes the request_id label; takes effect on restart.
       - CARDINALITY_DEMO_LABEL=${CARDINALITY_DEMO_LABEL:-request_id}
+      # A2 Part A: token bucket on POST /api/orders, per client IP.
+      - ORDERS_RATE_LIMIT_PER_SECOND=${ORDERS_RATE_LIMIT_PER_SECOND:-20}
+      - ORDERS_RATE_LIMIT_BURST=${ORDERS_RATE_LIMIT_BURST:-40}
     labels:
       co.elastic.logs/enabled: "true"
+    logging: *app-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -76,6 +90,38 @@ services:
       timeout: 3s
       retries: 20
       start_period: 10s
+    restart: unless-stopped
+
+  # A2 Part B: the gRPC order service. Same image and code as storefront-api,
+  # different entrypoint, so PlaceOrder and POST /api/orders run the same
+  # business rules (app/orders.py) against the same Postgres.
+  order-grpc:
+    build: ./services/storefront-api
+    container_name: order-grpc
+    command: ["python", "-m", "app.grpc_server"]
+    ports:
+      - "50051:50051"   # gRPC
+      - "9102:9102"     # Prometheus metrics
+    environment:
+      - SERVICE_NAME=order-grpc
+      - PAYMENT_SERVICE_URL=http://payment-service:8001
+      - DATABASE_URL=postgresql://shop:shop@postgres:5432/shop
+      - GRPC_PORT=50051
+      - GRPC_METRICS_PORT=9102
+    labels:
+      co.elastic.logs/enabled: "true"
+    logging: *app-logging
+    depends_on:
+      # storefront-api applies the schema migration on start; waiting for it
+      # avoids two processes racing to ALTER the same table.
+      storefront-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:9102/metrics')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
     restart: unless-stopped
 
   # -------------------------------------------------------------------- metrics

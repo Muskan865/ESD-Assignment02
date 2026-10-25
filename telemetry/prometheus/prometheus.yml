@@ -22,6 +22,16 @@ scrape_configs:
           service: storefront-api
           tier: application
 
+  # A2 Part B/C: the gRPC order service exposes Prometheus metrics over plain
+  # HTTP on a side port; gRPC itself is on 50051.
+  - job_name: order-grpc
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['order-grpc:9102']
+        labels:
+          service: order-grpc
+          tier: application
+
   - job_name: payment-service
     metrics_path: /metrics
     static_configs:

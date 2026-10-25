@@ -46,7 +46,14 @@
           "message": { "type": "text" },
           "stack_trace": { "type": "text", "index": false }
         } },
-        "container": { "properties": { "name": { "type": "keyword" } } }
+        "container": { "properties": { "name": { "type": "keyword" } } },
+        "interface": { "type": "keyword" },
+        "rpc": { "properties": {
+          "system": { "type": "keyword" },
+          "service": { "type": "keyword" },
+          "method": { "type": "keyword" },
+          "grpc": { "properties": { "status_code": { "type": "keyword" } } }
+        } }
       }
     }
   }

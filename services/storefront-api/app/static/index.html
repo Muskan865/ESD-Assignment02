@@ -218,9 +218,13 @@ $("checkout").onclick = async () => {
   const items = [...cart].map(([sku, line]) => ({ sku, quantity: line.quantity }));
   $("checkout").disabled = true;
   try {
-    const res = await fetch("/api/checkout", {
+    // One key per click: if the browser or a proxy repeats the request, the
+    // server answers with the same order instead of placing a second one.
+    const key = (crypto.randomUUID ? crypto.randomUUID()
+                 : Date.now().toString(36) + Math.random().toString(36).slice(2));
+    const res = await fetch("/api/orders", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "Idempotency-Key": key },
       body: JSON.stringify({
         items,
         customer: $("customer").value || "guest",
@@ -235,7 +239,10 @@ $("checkout").onclick = async () => {
     } else {
       // Rejections are normal business outcomes here: declined card, out of
       // stock, or the payment provider being down during a Part E experiment.
-      flash("Checkout failed: " + (body.detail || res.status), false);
+      // Every error is a problem+json document; `detail` is the readable part.
+      flash("Checkout failed: " + (body.detail || res.status) +
+            (res.status === 429 ? " (try again in " + res.headers.get("Retry-After") + " s)" : ""),
+            false);
     }
   } catch (err) {
     flash("Checkout failed: " + err.message, false);

@@ -1,0 +1,531 @@
+openapi: 3.1.0
+info:
+  title: Tiny Shop - Storefront API
+  version: 2.0.0
+  summary: A very small e-commerce HTTP API (Enterprise Software Development, Assignment 2).
+  description: |
+    The storefront's HTTP contract. This file is the source of truth: the
+    service serves it at `/openapi.json` (rendered at `/docs`), and
+    `tests/test_assignment2.py` checks the routes and the real responses
+    against it.
+
+    **Errors.** Every non-2xx response is an RFC 9457 problem document,
+    media type `application/problem+json`. Branch on `code`, which is stable;
+    `detail` is for people. The same `code` is sent by the gRPC service in its
+    `error-code` trailer.
+
+    **Correlation.** Send `x-request-id` to choose the id that will appear in
+    every log line for the request (in this service and in payment-service);
+    otherwise one is minted. It is echoed in the `x-request-id` response
+    header and in the body of order and error responses.
+
+    **Placing orders** is idempotent when an `Idempotency-Key` is sent and is
+    rate limited per client IP (default 40-request burst, 20 per second).
+servers:
+  - url: http://localhost:8000
+tags:
+  - name: shop
+    description: The catalogue.
+  - name: orders
+    description: Placing and managing orders.
+  - name: experiments
+    description: Operator-only fault injection and test controls (Assignment 1 Part E). Not for customers.
+  - name: ops
+    description: Probes and the Prometheus scrape endpoint.
+
+paths:
+  /api/products:
+    get:
+      tags: [shop]
+      operationId: listProducts
+      summary: List the product catalogue
+      responses:
+        "200":
+          description: Every product with its current stock.
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProductList" }
+        "503": { $ref: "#/components/responses/DatabaseBusy" }
+
+  /api/orders:
+    post:
+      tags: [orders]
+      operationId: createOrder
+      summary: Place an order
+      description: |
+        Reserves stock, charges the payment provider and stores the order in
+        one transaction: on any failure nothing is kept. Replaces Assignment
+        1's `POST /api/checkout`.
+
+        **Idempotency.** With an `Idempotency-Key`, a repeat of the same request
+        returns the original order (`201`, `replayed: true`, header
+        `Idempotent-Replayed: true`) without charging again; concurrent repeats
+        are serialised by the database. A failed attempt stores nothing, so it
+        can be retried with the same key. Reusing a key for a different body
+        is a `422 idempotency_key_reused`.
+
+        **Rate limit.** A token bucket per client IP, shared by every caller
+        behind that address: a burst of 40, refilled at 20 per second. Over the
+        limit the answer is `429` with `Retry-After` in seconds. Every request
+        spends a token, including invalid ones and replays.
+
+        The gRPC method `tinyshop.orders.v1.OrderService/PlaceOrder` runs the
+        same business rules against the same database.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OrderRequest" }
+            examples:
+              keyboard:
+                summary: Two keyboards, paid by card
+                value: { items: [ { sku: KB-01, quantity: 2 } ], customer: ayesha, payment_method: card }
+      responses:
+        "201":
+          description: Order placed - or, with a repeated Idempotency-Key, the order placed earlier.
+          headers:
+            Location: { $ref: "#/components/headers/Location" }
+            Idempotent-Replayed: { $ref: "#/components/headers/IdempotentReplayed" }
+            X-RateLimit-Limit: { $ref: "#/components/headers/RateLimitLimit" }
+            X-RateLimit-Remaining: { $ref: "#/components/headers/RateLimitRemaining" }
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderCreated" }
+        "402":
+          description: "`payment_declined`: the payment provider declined the charge."
+          content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } }
+        "409":
+          description: "`out_of_stock`: a line asks for more units than are in stock."
+          content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } }
+        "422":
+          description: |
+            `invalid_request`: the body or a header failed validation (`errors` lists each field);
+            `unknown_sku`: a line names a product that does not exist;
+            `idempotency_key_reused`: the key was used before for a different body.
+          content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502":
+          description: "`payment_error`: the payment provider failed. Nothing was kept; safe to retry."
+          content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } }
+        "503": { $ref: "#/components/responses/DatabaseBusy" }
+        "504":
+          description: "`payment_timeout`: the payment provider did not answer in time. Nothing was kept; safe to retry."
+          content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } }
+    get:
+      tags: [orders]
+      operationId: listOrders
+      summary: List recent orders, newest first
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: Up to `limit` orders.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderList" }
+        "422": { $ref: "#/components/responses/InvalidRequest" }
+        "503": { $ref: "#/components/responses/DatabaseBusy" }
+
+  /api/orders/{order_id}:
+    get:
+      tags: [orders]
+      operationId: getOrder
+      summary: Get one order
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: The order.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "404": { $ref: "#/components/responses/OrderNotFound" }
+        "422": { $ref: "#/components/responses/InvalidRequest" }
+        "503": { $ref: "#/components/responses/DatabaseBusy" }
+
+  /api/orders/{order_id}/cancel:
+    post:
+      tags: [orders]
+      operationId: cancelOrder
+      summary: Cancel a placed order
+      description: |
+        Returns the order's stock to the shelf. Idempotent: cancelling an
+        order that is already `CANCELLED` answers `200` and changes nothing.
+        A `FULFILLED` order cannot be cancelled.
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: The order is (now, or already) cancelled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderStatus" }
+        "404": { $ref: "#/components/responses/OrderNotFound" }
+        "409":
+          description: "`order_not_cancellable`: the order is FULFILLED."
+          content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } }
+        "422": { $ref: "#/components/responses/InvalidRequest" }
+        "503": { $ref: "#/components/responses/DatabaseBusy" }
+
+  /api/orders/{order_id}/fulfil:
+    post:
+      tags: [orders]
+      operationId: fulfilOrder
+      summary: Mark a placed order as shipped
+      description: Idempotent, like cancel. A `CANCELLED` order cannot be fulfilled.
+      parameters:
+        - $ref: "#/components/parameters/OrderId"
+      responses:
+        "200":
+          description: The order is (now, or already) fulfilled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrderStatus" }
+        "404": { $ref: "#/components/responses/OrderNotFound" }
+        "409":
+          description: "`order_not_fulfillable`: the order is CANCELLED."
+          content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } }
+        "422": { $ref: "#/components/responses/InvalidRequest" }
+        "503": { $ref: "#/components/responses/DatabaseBusy" }
+
+  # ------------------------------------------------------------ experiments
+  /admin/chaos/payment-latency:
+    post:
+      tags: [experiments]
+      operationId: setPaymentLatency
+      summary: Delay a fraction of payment calls
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LatencyFault" }
+      responses:
+        "200": { $ref: "#/components/responses/ChaosState" }
+        "422": { $ref: "#/components/responses/InvalidRequest" }
+  /admin/chaos/payment-failure:
+    post:
+      tags: [experiments]
+      operationId: setPaymentFailure
+      summary: Fail a fraction, or exactly the next N, of payment calls with 503
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FailureFault" }
+      responses:
+        "200": { $ref: "#/components/responses/ChaosState" }
+        "422": { $ref: "#/components/responses/InvalidRequest" }
+  /admin/chaos/cardinality:
+    post:
+      tags: [experiments]
+      operationId: toggleCardinalityDemo
+      summary: Start or stop the A1 Part E.2 unbounded-label demo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [active]
+              properties:
+                active: { type: boolean }
+      responses:
+        "200": { $ref: "#/components/responses/ChaosState" }
+        "422": { $ref: "#/components/responses/InvalidRequest" }
+  /admin/chaos/reset:
+    post:
+      tags: [experiments]
+      operationId: resetFaults
+      summary: Clear every injected fault in both services
+      responses:
+        "200": { $ref: "#/components/responses/ChaosState" }
+  /admin/chaos/status:
+    get:
+      tags: [experiments]
+      operationId: faultStatus
+      summary: Show the injected faults in both services
+      responses:
+        "200": { $ref: "#/components/responses/ChaosState" }
+  /admin/restock:
+    post:
+      tags: [experiments]
+      operationId: restock
+      summary: Set every product's stock to one level
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                level: { type: integer, minimum: 0, maximum: 100000, default: 500 }
+      responses:
+        "200":
+          description: Restocked.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, level]
+                properties:
+                  status: { type: string, const: ok }
+                  level: { type: integer }
+        "422": { $ref: "#/components/responses/InvalidRequest" }
+        "503": { $ref: "#/components/responses/DatabaseBusy" }
+  /admin/demo/safe-counter:
+    post:
+      tags: [experiments]
+      operationId: bumpSafeCounter
+      summary: Increment the bounded-label demo counter (A1 Part E.2)
+      parameters:
+        - name: tier
+          in: query
+          required: false
+          schema: { type: string, default: standard, description: "standard or vip; anything else counts as standard" }
+      responses:
+        "200":
+          description: Counted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tier]
+                properties:
+                  tier: { type: string, enum: [standard, vip] }
+
+  # -------------------------------------------------------------------- ops
+  /health:
+    get:
+      tags: [ops]
+      operationId: health
+      summary: Liveness probe
+      responses:
+        "200":
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, service]
+                properties:
+                  status: { type: string, const: ok }
+                  service: { type: string }
+  /ready:
+    get:
+      tags: [ops]
+      operationId: ready
+      summary: Readiness probe - is the database reachable?
+      responses:
+        "200":
+          description: Ready.
+          content:
+            application/json:
+              schema: { type: object }
+        "503":
+          description: The database is unreachable.
+          content:
+            application/json:
+              schema: { type: object }
+  /metrics:
+    get:
+      tags: [ops]
+      operationId: metrics
+      summary: Prometheus exposition format
+      responses:
+        "200":
+          description: Metrics, scraped by Prometheus every 5 s.
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  parameters:
+    OrderId:
+      name: order_id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1, maximum: 2147483647 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Caller-chosen, unique per logical order (a UUID is ideal). Reuse it on
+        every retry of that order, and never for a different one.
+      schema: { type: string, pattern: "^[A-Za-z0-9_\\-]{8,64}$" }
+      example: 0b5f3c6e-6f0e-4a59-9c64-1f0d2a7d9e11
+
+  headers:
+    RequestId:
+      description: The correlation id written on every log line for this request.
+      schema: { type: string }
+    Location:
+      description: URL of the created (or replayed) order.
+      schema: { type: string, example: /api/orders/1042 }
+    IdempotentReplayed:
+      description: Present, with value `true`, when the response is a replay of an earlier request with the same key.
+      schema: { type: string, enum: ["true"] }
+    RetryAfter:
+      description: Whole seconds to wait before the next call can succeed.
+      schema: { type: integer, minimum: 1 }
+    RateLimitLimit:
+      description: Bucket size (the burst) for this client.
+      schema: { type: integer }
+    RateLimitRemaining:
+      description: Whole tokens left in this client's bucket after this request.
+      schema: { type: integer, minimum: 0 }
+
+  responses:
+    InvalidRequest:
+      description: "`invalid_request`: a parameter or the body failed validation; `errors` lists each problem."
+      content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } }
+    OrderNotFound:
+      description: "`order_not_found`: there is no order with this id."
+      content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } }
+    DatabaseBusy:
+      description: "`database_busy`: no database connection became free within 2 s. Retry after `Retry-After`."
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+      content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } }
+    RateLimited:
+      description: "`rate_limited`: this client's bucket is empty."
+      headers:
+        Retry-After: { $ref: "#/components/headers/RetryAfter" }
+        X-RateLimit-Limit: { $ref: "#/components/headers/RateLimitLimit" }
+        X-RateLimit-Remaining: { $ref: "#/components/headers/RateLimitRemaining" }
+      content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } }
+    ChaosState:
+      description: The fault state after the change.
+      content:
+        application/json:
+          schema: { type: object }
+
+  schemas:
+    CartLine:
+      type: object
+      required: [sku, quantity]
+      properties:
+        sku: { type: string, minLength: 1, maxLength: 16, example: KB-01 }
+        quantity: { type: integer, minimum: 1, maximum: 20 }
+    OrderRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items: { $ref: "#/components/schemas/CartLine" }
+        customer:
+          type: string
+          minLength: 1
+          maxLength: 40
+          default: guest
+          description: A display name only - never an email, phone number or address.
+        payment_method: { type: string, enum: [card, wallet, cod], default: card }
+    OrderCreated:
+      type: object
+      required: [order_id, status, total_dollars, item_count, replayed, request_id]
+      properties:
+        order_id: { type: integer }
+        status: { type: string, enum: [PLACED, FULFILLED, CANCELLED], description: "PLACED, or the order's current status on a replay" }
+        total_dollars: { type: number }
+        item_count: { type: integer }
+        replayed: { type: boolean }
+        request_id: { type: string }
+    Order:
+      type: object
+      required: [id, status, total_cents, item_count, customer, created_at]
+      properties:
+        id: { type: integer }
+        status: { type: string, enum: [PLACED, FULFILLED, CANCELLED] }
+        total_cents: { type: integer }
+        item_count: { type: integer }
+        customer: { type: string }
+        created_at: { type: string }
+    OrderList:
+      type: object
+      required: [orders]
+      properties:
+        orders:
+          type: array
+          items: { $ref: "#/components/schemas/Order" }
+    OrderStatus:
+      type: object
+      required: [order_id, status]
+      properties:
+        order_id: { type: integer }
+        status: { type: string, enum: [PLACED, FULFILLED, CANCELLED] }
+    Product:
+      type: object
+      required: [sku, name, price_cents, stock]
+      properties:
+        sku: { type: string }
+        name: { type: string }
+        price_cents: { type: integer }
+        stock: { type: integer, minimum: 0 }
+    ProductList:
+      type: object
+      required: [products]
+      properties:
+        products:
+          type: array
+          items: { $ref: "#/components/schemas/Product" }
+    Problem:
+      type: object
+      description: RFC 9457 problem details, plus `code`, `request_id` and (for validation) `errors`.
+      required: [type, title, status, detail, code, request_id]
+      properties:
+        type: { type: string, description: "urn:tiny-shop:problem:<code>", example: "urn:tiny-shop:problem:out_of_stock" }
+        title: { type: string, description: The HTTP reason phrase., example: Conflict }
+        status: { type: integer, example: 409 }
+        detail: { type: string, example: "out of stock: KB-01" }
+        code:
+          type: string
+          description: Stable, machine-readable reason. Branch on this.
+          enum:
+            - invalid_request
+            - unknown_sku
+            - out_of_stock
+            - payment_declined
+            - payment_error
+            - payment_timeout
+            - idempotency_key_reused
+            - rate_limited
+            - order_not_found
+            - order_not_cancellable
+            - order_not_fulfillable
+            - database_busy
+            - not_found
+            - method_not_allowed
+            - internal_error
+        request_id: { type: string }
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, message, type]
+            properties:
+              field: { type: string, example: body.items.0.quantity }
+              message: { type: string }
+              type: { type: string }
+    LatencyFault:
+      type: object
+      required: [probability]
+      properties:
+        probability: { type: number, minimum: 0, maximum: 1 }
+        seconds: { type: number, minimum: 0, maximum: 10, default: 0.5 }
+    FailureFault:
+      type: object
+      required: [rate]
+      properties:
+        rate: { type: number, minimum: 0, maximum: 1 }
+        fail_next: { type: integer, minimum: 0, maximum: 1000, default: 0, description: Fail exactly the next N charges. }

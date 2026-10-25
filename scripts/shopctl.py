@@ -10,6 +10,7 @@ Standard library only. No `pip install` needed; any Python 3.8+ will do.
     python3 scripts/shopctl.py query 'sum(rate(http_requests_total[1m]))'
     python3 scripts/shopctl.py experiment          # full Part E.1 run
     python3 scripts/shopctl.py cardinality         # full Part E.2 run
+    python3 scripts/shopctl.py ratelimit           # A2 Part A: 201s, then 429
 """
 
 import argparse
@@ -26,6 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -150,7 +152,10 @@ def one_checkout(stats, cancel_rate, fulfil_rate):
         "customer": random.choice(["ayesha", "bilal", "chen", "dina", "omar", "guest"]),
         "payment_method": random.choices(["card", "wallet", "cod"], weights=[7, 2, 1])[0],
     }
-    status, body, elapsed = request("POST", f"{SHOP}/api/checkout", payload)
+    # Idempotency-Key so a checkout is never doubled; Assignment 2 renamed the
+    # endpoint from POST /api/checkout to POST /api/orders.
+    status, body, elapsed = request("POST", f"{SHOP}/api/orders", payload,
+                                    extra_headers={"Idempotency-Key": uuid.uuid4().hex})
     stats.record(status, elapsed)
 
     # Some customers change their mind; some orders ship. Both keep the
@@ -220,9 +225,9 @@ def print_summary(summary):
 # ------------------------------------------------------------- observations
 OBSERVATIONS = [
     ("http_p95_seconds",
-     'histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{job="storefront-api",route="/api/checkout"}[1m])))'),
+     'histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{job="storefront-api",route="/api/orders",method="POST"}[1m])))'),
     ("http_p99_seconds",
-     'histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{job="storefront-api",route="/api/checkout"}[1m])))'),
+     'histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{job="storefront-api",route="/api/orders",method="POST"}[1m])))'),
     ("checkout_p95_seconds",
      'histogram_quantile(0.95, sum by (le) (rate(shop_checkout_duration_seconds_bucket[1m])))'),
     ("payment_mean_seconds",
@@ -230,7 +235,7 @@ OBSERVATIONS = [
     ("payment_p95_seconds",
      'histogram_quantile(0.95, sum by (le) (rate(payment_call_duration_seconds_hist_bucket[1m])))'),
     ("requests_per_second",
-     'sum(rate(http_requests_total{job="storefront-api",route="/api/checkout"}[1m]))'),
+     'sum(rate(http_requests_total{job="storefront-api",route="/api/orders",method="POST"}[1m]))'),
     ("error_rate_5xx_percent",
      '100 * (sum(rate(http_requests_total{job="storefront-api",status=~"5.."}[1m])) or vector(0)) / clamp_min(sum(rate(http_requests_total{job="storefront-api"}[1m])), 0.001)'),
     ("orders_placed_per_min",
@@ -414,7 +419,8 @@ def cmd_experiment(args):
 
         # Elasticsearch query_string syntax: boolean operators are UPPERCASE.
         # (Kibana's KQL, used in the saved searches, takes lowercase `and`.)
-        checkout = 'url.route:"/api/checkout" AND message:"request completed"'
+        checkout = ('url.route:"/api/orders" AND http.request.method:"POST" '
+                    'AND message:"request completed"')
         wait_for_log_shipping(checkout, start, end)
         log_counts = {
             "checkout_requests": count_logs(checkout, start, end),
@@ -666,6 +672,7 @@ def cmd_verify(args):
         ("elasticsearch", f"{ES}/_cluster/health"),
         ("kibana", "http://localhost:5601/api/status"),
         ("node-exporter", "http://localhost:9100/metrics"),
+        ("order-grpc (metrics)", "http://localhost:9102/metrics"),
     ]
     failures = 0
     for name, url in checks:
@@ -687,6 +694,59 @@ def cmd_verify(args):
     print("\n  " + ("all checks passed" if failures == 0
                     else f"{failures} check(s) failed - see README troubleshooting"))
     return 0 if failures == 0 else 1
+
+
+def _lower(headers):
+    return {k.lower(): v for k, v in headers.items()}
+
+
+def _post_order(payload):
+    """POST /api/orders; return (status, headers, body) - the headers matter here."""
+    req = urllib.request.Request(
+        f"{SHOP}/api/orders", data=json.dumps(payload).encode(), method="POST",
+        headers={"content-type": "application/json", "Idempotency-Key": uuid.uuid4().hex})
+    try:
+        with urllib.request.urlopen(req, timeout=15.0) as resp:
+            return resp.status, _lower(resp.headers), json.loads(resp.read() or b"null")
+    except urllib.error.HTTPError as exc:
+        return exc.code, _lower(exc.headers), json.loads(exc.read() or b"null")
+
+
+def cmd_ratelimit(args):
+    """A2 Part A - a burst over the limit, the 429s, and recovery after Retry-After."""
+    request("POST", f"{SHOP}/admin/restock", {"level": 500})
+    payload = {"items": [{"sku": "CB-01", "quantity": 1}], "customer": "ratelimit-demo"}
+    print(f"  sending {args.requests} order requests from {args.concurrency} threads at once")
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        results = list(pool.map(lambda _: (_post_order(payload), time.perf_counter() - started),
+                                range(args.requests)))
+    took = time.perf_counter() - started
+    counts = Counter(status for (status, _, _), _ in results)
+    print(f"  finished in {took:.2f} s")
+    for status, n in sorted(counts.items()):
+        print(f"    HTTP {status} x {n}")
+
+    limited = [(h, b, t) for (s, h, b), t in results if s == 429]
+    accepted = [(h, t) for (s, h, _), t in results if s == 201]
+    if accepted:
+        h, t = accepted[-1]
+        print(f"  last accepted : X-RateLimit-Limit={h.get('x-ratelimit-limit')} "
+              f"X-RateLimit-Remaining={h.get('x-ratelimit-remaining')}")
+    if not limited:
+        print("  no 429 seen - raise --requests or --concurrency")
+        return 1
+    h, body, t = limited[0]
+    print(f"  first 429 at +{t:.2f} s: Retry-After={h.get('retry-after')} "
+          f"X-RateLimit-Remaining={h.get('x-ratelimit-remaining')}")
+    print("    " + json.dumps(body))
+    wait = int(h.get("retry-after", "1"))
+    print(f"  waiting Retry-After = {wait} s ...")
+    time.sleep(wait)
+    status, h, body = _post_order(payload)
+    print(f"  next request : HTTP {status} X-RateLimit-Remaining={h.get('x-ratelimit-remaining')}"
+          f" order_id={body.get('order_id') if isinstance(body, dict) else '-'}")
+    return 0 if status == 201 else 1
 
 
 def main():
@@ -739,6 +799,11 @@ def main():
 
     p = sub.add_parser("cardinality", help="Part E.2 - cardinality explosion")
     p.set_defaults(func=cmd_cardinality)
+
+    p = sub.add_parser("ratelimit", help="A2 Part A - exceed the POST /api/orders rate limit")
+    p.add_argument("--requests", type=int, default=60)
+    p.add_argument("--concurrency", type=int, default=10)
+    p.set_defaults(func=cmd_ratelimit)
 
     args = parser.parse_args()
     try:

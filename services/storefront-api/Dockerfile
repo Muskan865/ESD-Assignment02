@@ -5,10 +5,12 @@ WORKDIR /srv
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+COPY main.py openapi.yaml ./
 COPY app ./app
 
-EXPOSE 8000
+# 8000: HTTP API. The same image also runs the gRPC order service
+# (docker-compose `order-grpc`): 50051 gRPC, 9102 its Prometheus metrics.
+EXPOSE 8000 50051 9102
 
 # Single worker on purpose: prometheus_client keeps its registry in-process, so
 # N workers would expose N partial views of every counter.
