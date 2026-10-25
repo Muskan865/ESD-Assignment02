@@ -362,4 +362,4 @@ processes.
 - gRPC docs, *Status codes*; go-grpc-prometheus / py-grpc-prometheus (metric names only).
 - OpenAPI 3.1.0; FastAPI and Swagger UI docs.
 - The Assignment 1 stack — see [REPORT.md](REPORT.md#credits-and-sources).
-- AI assistance: *declare here as the course academic-integrity policy requires.*
+- AI assistance
